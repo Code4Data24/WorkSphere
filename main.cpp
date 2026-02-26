@@ -403,4 +403,298 @@ public:
         return store.size();
     }
 };
-int main() { return 0; }
+
+
+std::string jS(const std::string& s) {
+    std::string o = "\"";
+    for (char c : s) {
+        if      (c == '"')  o += "\\\"";
+        else if (c == '\\') o += "\\\\";
+        else if (c == '\n') o += "\\n";
+        else if (c == '\r') o += "\\r";
+        else if (c == '\t') o += "\\t";
+        else                o += c;
+    }
+    return o + '"';
+}
+
+std::string jVec(const std::vector<float>& v) {
+    std::ostringstream ss; ss << '[';
+    for (size_t i = 0; i < v.size(); i++) {
+        if (i) ss << ',';
+        ss << std::fixed << std::setprecision(4) << v[i];
+    }
+    return ss.str() + ']';
+}
+
+std::vector<float> parseVec(const std::string& s) {
+    std::vector<float> v;
+    std::istringstream ss(s); std::string t;
+    while (std::getline(ss, t, ','))
+        try { v.push_back(std::stof(t)); } catch (...) {}
+    return v;
+}
+
+std::string extractStr(const std::string& body, const std::string& key) {
+    size_t p = body.find('"' + key + '"');
+    if (p == std::string::npos) return "";
+    p = body.find(':', p) + 1;
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
+    if (p >= body.size() || body[p] != '"') return "";
+    p++;
+    std::string result;
+    while (p < body.size()) {
+        if (body[p] == '"') break;
+        if (body[p] == '\\' && p + 1 < body.size()) {
+            p++;
+            switch (body[p]) {
+                case '"':  result += '"';  break;
+                case '\\': result += '\\'; break;
+                case 'n':  result += '\n'; break;
+                case 'r':  result += '\r'; break;
+                case 't':  result += '\t'; break;
+                default:   result += body[p]; break;
+            }
+        } else {
+            result += body[p];
+        }
+        p++;
+    }
+    return result;
+}
+
+int extractInt(const std::string& body, const std::string& key, int def = 0) {
+    size_t p = body.find('"' + key + '"');
+    if (p == std::string::npos) return def;
+    p = body.find(':', p) + 1;
+    while (p < body.size() && (body[p] == ' ' || body[p] == '\t')) p++;
+    try { return std::stoi(body.substr(p)); } catch (...) { return def; }
+}
+
+bool parseBody(const std::string& b, std::string& meta,
+               std::string& cat, std::vector<float>& emb)
+{
+    meta = extractStr(b, "metadata");
+    cat  = extractStr(b, "category");
+    auto extractArr = [&](const std::string& key) -> std::vector<float> {
+        size_t p = b.find('"' + key + '"');
+        if (p == std::string::npos) return {};
+        p = b.find('[', p);
+        if (p == std::string::npos) return {};
+        size_t e = b.find(']', p);
+        if (e == std::string::npos) return {};
+        return parseVec(b.substr(p + 1, e - p - 1));
+    };
+    emb = extractArr("embedding");
+    return !meta.empty() && !emb.empty();
+}
+
+void cors(httplib::Response& res) {
+    res.set_header("Access-Control-Allow-Origin",  "*");
+    res.set_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
+    res.set_header("Access-Control-Allow-Headers", "Content-Type");
+}
+
+//  demo data 16D categorical vectors
+
+void loadDemo(VectorDB& db) {
+    auto dist = getDistFn("cosine");
+    // Dims 0-3: CS | Dims 4-7: Math | Dims 8-11: Food | Dims 12-15: Sports
+    db.insert("Linked List: nodes connected by pointers", "cs",
+        {0.90f,0.85f,0.72f,0.68f,0.12f,0.08f,0.15f,0.10f,0.05f,0.08f,0.06f,0.09f,0.07f,0.11f,0.08f,0.06f}, dist);
+    db.insert("Binary Search Tree: O(log n) search and insert", "cs",
+        {0.88f,0.82f,0.78f,0.74f,0.15f,0.10f,0.08f,0.12f,0.06f,0.07f,0.08f,0.05f,0.09f,0.06f,0.07f,0.10f}, dist);
+    db.insert("Dynamic Programming: memoization overlapping subproblems", "cs",
+        {0.82f,0.76f,0.88f,0.80f,0.20f,0.18f,0.12f,0.09f,0.07f,0.06f,0.08f,0.07f,0.08f,0.09f,0.06f,0.07f}, dist);
+    db.insert("Graph BFS and DFS: breadth and depth first traversal", "cs",
+        {0.85f,0.80f,0.75f,0.82f,0.18f,0.14f,0.10f,0.08f,0.06f,0.09f,0.07f,0.06f,0.10f,0.08f,0.09f,0.07f}, dist);
+    db.insert("Hash Table: O(1) lookup with collision chaining", "cs",
+        {0.87f,0.78f,0.70f,0.76f,0.13f,0.11f,0.09f,0.14f,0.08f,0.07f,0.06f,0.08f,0.07f,0.10f,0.08f,0.09f}, dist);
+    db.insert("Calculus: derivatives integrals and limits", "math",
+        {0.12f,0.15f,0.18f,0.10f,0.91f,0.86f,0.78f,0.72f,0.08f,0.06f,0.07f,0.09f,0.07f,0.08f,0.06f,0.10f}, dist);
+    db.insert("Linear Algebra: matrices eigenvalues eigenvectors", "math",
+        {0.20f,0.18f,0.15f,0.12f,0.88f,0.90f,0.82f,0.76f,0.09f,0.07f,0.08f,0.06f,0.10f,0.07f,0.08f,0.09f}, dist);
+    db.insert("Probability: distributions random variables Bayes theorem", "math",
+        {0.15f,0.12f,0.20f,0.18f,0.84f,0.80f,0.88f,0.82f,0.07f,0.08f,0.06f,0.10f,0.09f,0.06f,0.09f,0.08f}, dist);
+    db.insert("Number Theory: primes modular arithmetic RSA cryptography", "math",
+        {0.22f,0.16f,0.14f,0.20f,0.80f,0.85f,0.76f,0.90f,0.08f,0.09f,0.07f,0.06f,0.08f,0.10f,0.07f,0.06f}, dist);
+    db.insert("Combinatorics: permutations combinations generating functions", "math",
+        {0.18f,0.20f,0.16f,0.14f,0.86f,0.78f,0.84f,0.80f,0.06f,0.07f,0.09f,0.08f,0.06f,0.09f,0.10f,0.07f}, dist);
+    db.insert("Sushi: vinegared rice avocado cucumber nori rolls", "food",
+        {0.08f,0.06f,0.09f,0.07f,0.07f,0.08f,0.06f,0.09f,0.90f,0.86f,0.78f,0.72f,0.08f,0.06f,0.09f,0.07f}, dist);
+    db.insert("Caprese Salad: fresh mozzarella tomatoes basil balsamic", "food",
+        {0.06f,0.08f,0.07f,0.09f,0.09f,0.06f,0.08f,0.07f,0.86f,0.90f,0.82f,0.76f,0.07f,0.09f,0.06f,0.08f}, dist);
+    db.insert("Burger:patty lettuce tomato pickle", "food",
+        {0.07f,0.09f,0.08f,0.06f,0.06f,0.07f,0.09f,0.08f,0.78f,0.82f,0.86f,0.90f,0.06f,0.08f,0.07f,0.09f}, dist);
+    db.insert("Croissant: laminated pastry with buttery flaky layers", "food",
+        {0.06f,0.07f,0.10f,0.09f,0.10f,0.06f,0.07f,0.10f,0.85f,0.80f,0.76f,0.82f,0.09f,0.07f,0.10f,0.06f}, dist);
+    db.insert("Tacos: corn tortilla beans avocado salsa cilantro", "food",
+        {0.08f,0.06f,0.09f,0.07f,0.07f,0.08f,0.06f,0.09f,0.88f,0.85f,0.80f,0.78f,0.08f,0.06f,0.09f,0.07f}, dist);
+    db.insert("Basketball: fast-paced shooting dribbling slam dunks", "sports",
+        {0.09f,0.07f,0.08f,0.10f,0.08f,0.09f,0.07f,0.06f,0.08f,0.07f,0.09f,0.06f,0.91f,0.85f,0.78f,0.72f}, dist);
+    db.insert("Football: tackles touchdowns field goals and strategy", "sports",
+        {0.07f,0.09f,0.06f,0.08f,0.09f,0.07f,0.10f,0.08f,0.07f,0.09f,0.08f,0.07f,0.87f,0.89f,0.82f,0.76f}, dist);
+    db.insert("Tennis: racket volleys groundstrokes and Wimbledon serves", "sports",
+        {0.08f,0.06f,0.09f,0.07f,0.07f,0.08f,0.06f,0.09f,0.09f,0.06f,0.07f,0.08f,0.83f,0.80f,0.88f,0.82f}, dist);
+    db.insert("Chess: openings endgames tactics strategic board game", "sports",
+        {0.25f,0.20f,0.22f,0.18f,0.22f,0.18f,0.20f,0.15f,0.06f,0.08f,0.07f,0.09f,0.80f,0.84f,0.78f,0.90f}, dist);
+    db.insert("Swimming: butterfly freestyle backstroke Olympic competition", "sports",
+        {0.06f,0.08f,0.07f,0.09f,0.08f,0.06f,0.09f,0.07f,0.10f,0.08f,0.06f,0.07f,0.85f,0.82f,0.86f,0.80f}, dist);
+}
+
+//  HTTP server
+
+
+int main() {
+    VectorDB   db(DIMS);
+    loadDemo(db);
+    httplib::Server svr;
+
+    // CORS preflight
+    svr.Options(".*", [](const httplib::Request&, httplib::Response& res) {
+        cors(res); res.status = 204;
+    });
+    // demo vector endpoints 
+
+    svr.Get("/search", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto q = parseVec(req.get_param_value("v"));
+        if ((int)q.size() != DIMS) {
+            res.set_content("{\"error\":\"need " + std::to_string(DIMS) + "D vector\"}",
+                            "application/json"); return;
+        }
+        int k = 5;
+        try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
+        auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
+        auto algo   = req.get_param_value("algo");   if (algo.empty())   algo   = "hnsw";
+
+        auto out = db.search(q, k, metric, algo);
+        std::ostringstream ss;
+        ss << "{\"results\":[";
+        for (size_t i = 0; i < out.hits.size(); i++) {
+            if (i) ss << ',';
+            auto& h = out.hits[i];
+            ss << "{\"id\":"        << h.id
+               << ",\"metadata\":"  << jS(h.meta)
+               << ",\"category\":"  << jS(h.cat)
+               << ",\"distance\":"  << std::fixed << std::setprecision(6) << h.dist
+               << ",\"embedding\":" << jVec(h.emb) << '}';
+        }
+        ss << "],\"latencyUs\":" << out.us
+           << ",\"algo\":"       << jS(out.algo)
+           << ",\"metric\":"     << jS(out.metric) << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Post("/insert", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        std::string meta, cat; std::vector<float> emb;
+        if (!parseBody(req.body, meta, cat, emb) || (int)emb.size() != DIMS) {
+            res.set_content("{\"error\":\"invalid body\"}", "application/json"); return;
+        }
+        int id = db.insert(meta, cat, emb, getDistFn("cosine"));
+        res.set_content("{\"id\":" + std::to_string(id) + "}", "application/json");
+    });
+
+    svr.Delete(R"(/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        int id  = std::stoi(req.matches[1]);
+        bool ok = db.remove(id);
+        res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
+                        "application/json");
+    });
+
+    svr.Get("/items", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        auto items = db.all();
+        std::ostringstream ss; ss << '[';
+        for (size_t i = 0; i < items.size(); i++) {
+            if (i) ss << ',';
+            auto& v = items[i];
+            ss << "{\"id\":"        << v.id
+               << ",\"metadata\":"  << jS(v.metadata)
+               << ",\"category\":"  << jS(v.category)
+               << ",\"embedding\":" << jVec(v.emb) << '}';
+        }
+        ss << ']';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Get("/benchmark", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto q = parseVec(req.get_param_value("v"));
+        if ((int)q.size() != DIMS) {
+            res.set_content("{\"error\":\"need " + std::to_string(DIMS) + "D vector\"}",
+                            "application/json"); return;
+        }
+        int k = 5; try { k = std::stoi(req.get_param_value("k")); } catch (...) {}
+        auto metric = req.get_param_value("metric"); if (metric.empty()) metric = "cosine";
+        auto b = db.benchmark(q, k, metric);
+        std::ostringstream ss;
+        ss << "{\"bruteforceUs\":" << b.bfUs << ",\"kdtreeUs\":" << b.kdUs
+           << ",\"hnswUs\":"       << b.hnswUs << ",\"itemCount\":" << b.n << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Get("/hnsw-info", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        auto gi = db.hnswInfo();
+        std::ostringstream ss;
+        ss << "{\"topLayer\":" << gi.topLayer << ",\"nodeCount\":" << gi.nodeCount
+           << ",\"nodesPerLayer\":[";
+        for (size_t i = 0; i < gi.nodesPerLayer.size(); i++) {
+            if (i) ss << ','; ss << gi.nodesPerLayer[i];
+        }
+        ss << "],\"edgesPerLayer\":[";
+        for (size_t i = 0; i < gi.edgesPerLayer.size(); i++) {
+            if (i) ss << ','; ss << gi.edgesPerLayer[i];
+        }
+        ss << "],\"nodes\":[";
+        for (size_t i = 0; i < gi.nodes.size(); i++) {
+            if (i) ss << ',';
+            auto& n = gi.nodes[i];
+            ss << "{\"id\":" << n.id << ",\"metadata\":" << jS(n.metadata)
+               << ",\"category\":" << jS(n.category) << ",\"maxLyr\":" << n.maxLyr << '}';
+        }
+        ss << "],\"edges\":[";
+        for (size_t i = 0; i < gi.edges.size(); i++) {
+            if (i) ss << ',';
+            auto& e = gi.edges[i];
+            ss << "{\"src\":" << e.src << ",\"dst\":" << e.dst << ",\"lyr\":" << e.lyr << '}';
+        }
+        ss << "]}";
+        res.set_content(ss.str(), "application/json");
+    });
+
+    // serve index.html
+    svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
+        std::ifstream f("index.html");
+        if (!f.is_open()) { res.status = 404; return; }
+        res.set_content(
+            std::string(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>()),
+            "text/html");
+    });
+
+    svr.Get("/styles.css", [](const httplib::Request&, httplib::Response& res) {
+        std::ifstream f("styles.css");
+        if (!f.is_open()) { res.status = 404; return; }
+        res.set_content(
+            std::string(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>()),
+            "text/css");
+    });
+
+    svr.Get("/app.js", [](const httplib::Request&, httplib::Response& res) {
+        std::ifstream f("app.js");
+        if (!f.is_open()) { res.status = 404; return; }
+        res.set_content(
+            std::string(std::istreambuf_iterator<char>(f),
+                        std::istreambuf_iterator<char>()),
+            "application/javascript");
+    });
+
+    svr.listen("0.0.0.0", 8080);
+    return 0;
+}
+
