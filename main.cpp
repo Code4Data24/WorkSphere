@@ -495,6 +495,177 @@ void cors(httplib::Response& res) {
     res.set_header("Access-Control-Allow-Headers", "Content-Type");
 }
 
+//  text chunker
+
+std::vector<std::string> chunkText(const std::string& text,
+                                   int chunkWords = 250, int overlapWords = 30)
+{
+    std::istringstream ss(text);
+    std::vector<std::string> words;
+    std::string w;
+    while (ss >> w) words.push_back(w);
+
+    if (words.empty()) return {};
+    if ((int)words.size() <= chunkWords) return {text};
+
+    std::vector<std::string> chunks;
+    int step = chunkWords - overlapWords;
+    for (int i = 0; i < (int)words.size(); i += step) {
+        int end = std::min(i + chunkWords, (int)words.size());
+        std::string chunk;
+        for (int j = i; j < end; j++) { if (j > i) chunk += ' '; chunk += words[j]; }
+        chunks.push_back(chunk);
+        if (end == (int)words.size()) break;
+    }
+    return chunks;
+}
+
+//  OLLAMA CLIENT 
+
+class OllamaClient {
+    std::string host;
+    int         port;
+
+    
+    std::string esc(const std::string& s) {
+        std::string o;
+        for (char c : s) {
+            if      (c == '"')  o += "\\\"";
+            else if (c == '\\') o += "\\\\";
+            else if (c == '\n') o += "\\n";
+            else if (c == '\r') o += "\\r";
+            else if (c == '\t') o += "\\t";
+            else                o += c;
+        }
+        return o;
+    }
+
+    
+    std::vector<float> parseEmbedding(const std::string& body) {
+        size_t p = body.find("\"embedding\"");
+        if (p == std::string::npos) return {};
+        p = body.find('[', p);
+        if (p == std::string::npos) return {};
+        
+        size_t e = p + 1, depth = 1;
+        while (e < body.size() && depth > 0) {
+            if (body[e] == '[') depth++;
+            else if (body[e] == ']') depth--;
+            e++;
+        }
+        return parseVec(body.substr(p + 1, e - p - 2));
+    }
+
+    
+    std::string parseResponse(const std::string& body) {
+        return extractStr(body, "response");
+    }
+
+public:
+    std::string embedModel = "nomic-embed-text";
+    std::string genModel   = "llama3.2";
+
+    OllamaClient(const std::string& h = "127.0.0.1", int p = 11434)
+        : host(h), port(p) {}
+
+    bool isAvailable() {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(2, 0);
+        auto res = cli.Get("/api/tags");
+        return res && res->status == 200;
+    }
+
+    
+    std::vector<float> embed(const std::string& text) {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(3, 0);
+        cli.set_read_timeout(30, 0);
+        std::string body = "{\"model\":\"" + embedModel + "\",\"prompt\":\"" + esc(text) + "\"}";
+        auto res = cli.Post("/api/embeddings", body, "application/json");
+        if (!res || res->status != 200) return {};
+        return parseEmbedding(res->body);
+    }
+
+   
+    std::string generate(const std::string& prompt) {
+        httplib::Client cli(host, port);
+        cli.set_connection_timeout(3, 0);
+        cli.set_read_timeout(180, 0);   
+        std::string body = "{\"model\":\"" + genModel + "\","
+                           "\"prompt\":\"" + esc(prompt) + "\","
+                           "\"stream\":false}";
+        auto res = cli.Post("/api/generate", body, "application/json");
+        if (!res || res->status != 200)
+            return "ERROR: Ollama unavailable. Run: ollama serve";
+        return parseResponse(res->body);
+    }
+};
+
+
+
+struct DocItem {
+    int         id;
+    std::string title;
+    std::string text;
+    std::vector<float> emb;
+};
+
+class DocumentDB {
+    std::unordered_map<int, DocItem> store;
+    HNSW       hnsw;
+    BruteForce bf;       // brute force fallback for small sets
+    int nextId = 1;
+    int dims   = 0;      // determined from first inserted embedding
+
+public:
+    DocumentDB() : hnsw(16, 200) {}
+
+    
+    int insert(const std::string& title, const std::string& text,
+               const std::vector<float>& emb)
+    {
+        if (dims == 0) dims = (int)emb.size();
+        DocItem item{nextId++, title, text, emb};
+        store[item.id] = item;
+        VectorItem vi{item.id, title, "doc", emb};
+        hnsw.insert(vi, cosine);
+        bf.insert(vi);
+        return item.id;
+    }
+
+    // semantic search 
+    std::vector<std::pair<float, DocItem>> search(
+        const std::vector<float>& q, int k, float max_dist = 0.7f)
+    {
+        if (store.empty()) return {};
+        auto raw = (store.size() < 10)
+                   ? bf.knn(q, k, cosine)
+                   : hnsw.knn(q, k, 50, cosine);
+        std::vector<std::pair<float, DocItem>> out;
+        for (auto& [d, id] : raw)
+            if (store.count(id) && d <= max_dist) out.push_back({d, store[id]});
+        return out;
+    }
+
+    bool remove(int id) {
+        if (!store.count(id)) return false;
+        store.erase(id); hnsw.remove(id); bf.remove(id);
+        return true;
+    }
+
+    std::vector<DocItem> all() {
+        std::vector<DocItem> r;
+        for (auto& [id, v] : store) r.push_back(v);
+        return r;
+    }
+
+    size_t size() {
+        return store.size();
+    }
+
+    int getDims() { return dims; }
+};
+
 //  demo data 16D categorical vectors
 
 void loadDemo(VectorDB& db) {
@@ -548,6 +719,16 @@ void loadDemo(VectorDB& db) {
 int main() {
     VectorDB   db(DIMS);
     loadDemo(db);
+    DocumentDB docDB;
+    OllamaClient ollama;
+    // Check Ollama at startup 
+    bool ollamaUp = ollama.isAvailable();
+    std::cout << "=== VectorDB Engine ===" << std::endl;
+    std::cout << "http://localhost:8080" << std::endl;
+    std::cout << db.size() << " demo vectors | " << DIMS << " dims | HNSW+KD-Tree+BruteForce" << std::endl;
+    std::cout << "Ollama: " << (ollamaUp ? "ONLINE" : "OFFLINE (install from ollama.com)") << std::endl;
+    if (ollamaUp) std::cout << "  embed model: " << ollama.embedModel
+                            << "  gen model: "   << ollama.genModel << std::endl;
     httplib::Server svr;
 
     // CORS preflight
@@ -665,6 +846,182 @@ int main() {
         ss << "]}";
         res.set_content(ss.str(), "application/json");
     });
+
+    // document + RAG endpoints 
+
+    // POST /doc/insert  
+    
+    svr.Post("/doc/insert", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto title = extractStr(req.body, "title");
+        auto text  = extractStr(req.body, "text");
+        if (title.empty() || text.empty()) {
+            res.set_content("{\"error\":\"need title and text\"}", "application/json"); return;
+        }
+
+        auto chunks = chunkText(text, 250, 30);
+        std::vector<int> ids;
+
+        for (int i = 0; i < (int)chunks.size(); i++) {
+            auto emb = ollama.embed(chunks[i]);
+            if (emb.empty()) {
+                res.set_content(
+                    "{\"error\":\"Ollama unavailable. "
+                    "Install from https://ollama.com then run: "
+                    "ollama pull nomic-embed-text && ollama pull llama3.2\"}",
+                    "application/json");
+                return;
+            }
+            std::string chunkTitle = (chunks.size() > 1)
+                ? title + " [" + std::to_string(i+1) + "/" + std::to_string(chunks.size()) + "]"
+                : title;
+            ids.push_back(docDB.insert(chunkTitle, chunks[i], emb));
+        }
+
+        std::ostringstream ss;
+        ss << "{\"ids\":[";
+        for (size_t i = 0; i < ids.size(); i++) { if (i) ss << ','; ss << ids[i]; }
+        ss << "],\"chunks\":" << chunks.size()
+           << ",\"dims\":"    << docDB.getDims() << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    // DEL /doc/delete/123
+    svr.Delete(R"(/doc/delete/(\d+))", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        int id  = std::stoi(req.matches[1]);
+        bool ok = docDB.remove(id);
+        res.set_content("{\"ok\":" + std::string(ok ? "true" : "false") + "}",
+                        "application/json");
+    });
+
+    // GET /doc/list
+    svr.Get("/doc/list", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        auto docs = docDB.all();
+        std::ostringstream ss; ss << '[';
+        for (size_t i = 0; i < docs.size(); i++) {
+            if (i) ss << ',';
+            
+            std::string preview = docs[i].text.substr(0, 120);
+            if (docs[i].text.size() > 120) preview += "…";
+            ss << "{\"id\":" << docs[i].id
+               << ",\"title\":" << jS(docs[i].title)
+               << ",\"preview\":" << jS(preview)
+               << ",\"words\":"  << (int)std::count(docs[i].text.begin(), docs[i].text.end(), ' ') + 1
+               << '}';
+        }
+        ss << ']';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    // POST /doc/search 
+    svr.Post("/doc/search", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto question = extractStr(req.body, "question");
+        int  k        = extractInt(req.body, "k", 3);
+        if (question.empty()) {
+            res.set_content("{\"error\":\"need question\"}", "application/json"); return;
+        }
+
+        auto qEmb = ollama.embed(question);
+        if (qEmb.empty()) {
+            res.set_content("{\"error\":\"Ollama unavailable\"}", "application/json"); return;
+        }
+
+        auto hits = docDB.search(qEmb, k);
+
+        std::ostringstream ss;
+        ss << "{\"contexts\":[";
+        for (size_t i = 0; i < hits.size(); i++) {
+            if (i) ss << ',';
+            ss << "{\"id\":"       << hits[i].second.id
+               << ",\"title\":"    << jS(hits[i].second.title)
+               << ",\"distance\":" << std::fixed << std::setprecision(4) << hits[i].first << '}';
+        }
+        ss << "]}";
+        res.set_content(ss.str(), "application/json");
+    });
+
+    // POST /doc/ask  
+    //  RAG pipeline: embed → retrieve → generate
+    svr.Post("/doc/ask", [&](const httplib::Request& req, httplib::Response& res) {
+        cors(res);
+        auto question = extractStr(req.body, "question");
+        int  k        = extractInt(req.body, "k", 3);
+        if (question.empty()) {
+            res.set_content("{\"error\":\"need question\"}", "application/json"); return;
+        }
+
+        //embed the question
+        auto qEmb = ollama.embed(question);
+        if (qEmb.empty()) {
+            res.set_content("{\"error\":\"Ollama unavailable\"}", "application/json"); return;
+        }
+
+        //retrieve top-k relevant chunks
+        auto hits = docDB.search(qEmb, k);
+
+        // build prompt
+        std::ostringstream ctx;
+        for (int i = 0; i < (int)hits.size(); i++) {
+            ctx << "[" << (i+1) << "] " << hits[i].second.title << ":\n"
+                << hits[i].second.text << "\n\n";
+        }
+        std::string prompt =
+            "You are a helpful assistant. Answer the user's question directly. "
+            "Use the provided context if it contains relevant information. "
+            "If it doesn't, just use your own general knowledge. "
+            "IMPORTANT: Do NOT mention the 'context', 'provided text', or say things like 'the context doesn't mention'. "
+            "Just answer the question naturally.\n\n"
+            "Context:\n" + ctx.str() +
+            "Question: " + question + "\n\n"
+            "Answer:";
+
+        // generate answer
+        auto answer = ollama.generate(prompt);
+
+       
+        std::ostringstream ss;
+        ss << "{\"answer\":" << jS(answer)
+           << ",\"model\":"  << jS(ollama.genModel)
+           << ",\"contexts\":[";
+        for (size_t i = 0; i < hits.size(); i++) {
+            if (i) ss << ',';
+            ss << "{\"id\":"       << hits[i].second.id
+               << ",\"title\":"    << jS(hits[i].second.title)
+               << ",\"text\":"     << jS(hits[i].second.text)
+               << ",\"distance\":" << std::fixed << std::setprecision(4) << hits[i].first << '}';
+        }
+        ss << "],\"docCount\":" << docDB.size() << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    // GET /status
+    svr.Get("/status", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        bool up = ollama.isAvailable();
+        std::ostringstream ss;
+        ss << "{\"ollamaAvailable\":"  << (up ? "true" : "false")
+           << ",\"embedModel\":"       << jS(ollama.embedModel)
+           << ",\"genModel\":"         << jS(ollama.genModel)
+           << ",\"docCount\":"         << docDB.size()
+           << ",\"docDims\":"          << docDB.getDims()
+           << ",\"demoDims\":"         << DIMS
+           << ",\"demoCount\":"        << db.size() << '}';
+        res.set_content(ss.str(), "application/json");
+    });
+
+    svr.Get("/stats", [&](const httplib::Request&, httplib::Response& res) {
+        cors(res);
+        std::ostringstream ss;
+        ss << "{\"count\":"      << db.size()
+           << ",\"dims\":"       << DIMS
+           << ",\"algorithms\":[\"bruteforce\",\"kdtree\",\"hnsw\"]"
+           << ",\"metrics\":[\"euclidean\",\"cosine\",\"manhattan\"]}";
+        res.set_content(ss.str(), "application/json");
+    });
+
 
     // serve index.html
     svr.Get("/", [](const httplib::Request&, httplib::Response& res) {
