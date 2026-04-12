@@ -6,6 +6,7 @@
 #include <cmath>
 #include <random>
 #include <chrono>
+#include <mutex>
 #include <unordered_map>
 #include <queue>
 #include <set>
@@ -323,6 +324,7 @@ class VectorDB {
     BruteForce bf;
     KDTree     kdt;
     HNSW       hnsw;
+    std::mutex mu;
     int nextId = 1;
 
 public:
@@ -332,6 +334,7 @@ public:
     int insert(const std::string& meta, const std::string& cat,
                const std::vector<float>& emb, DistFn dist)
     {
+        std::lock_guard<std::mutex> lk(mu);
         VectorItem v{nextId++, meta, cat, emb};
         store[v.id] = v;
         bf.insert(v); kdt.insert(v); hnsw.insert(v, dist);
@@ -339,6 +342,7 @@ public:
     }
 
     bool remove(int id) {
+        std::lock_guard<std::mutex> lk(mu);
         if (!store.count(id)) return false;
         store.erase(id); bf.remove(id); hnsw.remove(id);
         std::vector<VectorItem> rem;
@@ -352,7 +356,7 @@ public:
 
     SearchOut search(const std::vector<float>& q, int k,
                      const std::string& metric, const std::string& algo)
-    {
+    {   std::lock_guard<std::mutex> lk(mu);
         auto dfn = getDistFn(metric);
         auto t0  = std::chrono::high_resolution_clock::now();
 
@@ -374,6 +378,7 @@ public:
     struct BenchOut { long long bfUs, kdUs, hnswUs; int n; };
 
     BenchOut benchmark(const std::vector<float>& q, int k, const std::string& metric) {
+        std::lock_guard<std::mutex> lk(mu);
         auto dfn  = getDistFn(metric);
         auto time = [&](auto fn) -> long long {
             auto t = std::chrono::high_resolution_clock::now();
@@ -390,16 +395,19 @@ public:
     }
 
     std::vector<VectorItem> all() {
+        std::lock_guard<std::mutex> lk(mu);
         std::vector<VectorItem> r;
         for (auto& [id, v] : store) r.push_back(v);
         return r;
     }
 
     HNSW::GraphInfo hnswInfo() {
+        std::lock_guard<std::mutex> lk(mu);
         return hnsw.getInfo();
     }
 
     size_t size() {
+        std::lock_guard<std::mutex> lk(mu);
         return store.size();
     }
 };
@@ -520,7 +528,7 @@ std::vector<std::string> chunkText(const std::string& text,
     return chunks;
 }
 
-//  OLLAMA CLIENT 
+//  OLLAMA  
 
 class OllamaClient {
     std::string host;
@@ -613,17 +621,18 @@ struct DocItem {
 class DocumentDB {
     std::unordered_map<int, DocItem> store;
     HNSW       hnsw;
-    BruteForce bf;       // brute force fallback for small sets
+    BruteForce bf;       //// brute force fallback
+    std::mutex mu;      
     int nextId = 1;
-    int dims   = 0;      // determined from first inserted embedding
-
+    int dims   = 0;      
 public:
     DocumentDB() : hnsw(16, 200) {}
 
     
     int insert(const std::string& title, const std::string& text,
                const std::vector<float>& emb)
-    {
+    {   
+        std::lock_guard<std::mutex> lk(mu);
         if (dims == 0) dims = (int)emb.size();
         DocItem item{nextId++, title, text, emb};
         store[item.id] = item;
@@ -636,7 +645,8 @@ public:
     // semantic search 
     std::vector<std::pair<float, DocItem>> search(
         const std::vector<float>& q, int k, float max_dist = 0.7f)
-    {
+    {   
+        std::lock_guard<std::mutex> lk(mu);
         if (store.empty()) return {};
         auto raw = (store.size() < 10)
                    ? bf.knn(q, k, cosine)
@@ -648,18 +658,21 @@ public:
     }
 
     bool remove(int id) {
+        std::lock_guard<std::mutex> lk(mu);
         if (!store.count(id)) return false;
         store.erase(id); hnsw.remove(id); bf.remove(id);
         return true;
     }
 
     std::vector<DocItem> all() {
+        std::lock_guard<std::mutex> lk(mu);
         std::vector<DocItem> r;
         for (auto& [id, v] : store) r.push_back(v);
         return r;
     }
 
     size_t size() {
+        std::lock_guard<std::mutex> lk(mu);
         return store.size();
     }
 

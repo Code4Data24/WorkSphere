@@ -279,6 +279,217 @@ async function loadHNSW() {
   } catch (_) { }
 }
 
+//  DOCUMENT MANAGEMENT
+// ════════════════════════════════════════════════════════════
+async function checkOllamaStatus() {
+  try {
+    const r = await fetch(API + '/status'), d = await r.json();
+    const badge = document.getElementById('ollamaBadge');
+    const box = document.getElementById('ollamaStatus');
+    if (d.ollamaAvailable) {
+      badge.className = 'badge ok'; badge.textContent = 'OLLAMA ✓';
+      box.className = 'ollama-status ok';
+      box.innerHTML = `<span style="color:var(--green)">● Online</span><br>` +
+        `Embed: <span style="color:var(--accent)">${d.embedModel}</span><br>` +
+        `Generate: <span style="color:var(--accent)">${d.genModel}</span><br>` +
+        `Dims: <span style="color:var(--muted)">${d.docDims || '(first insert sets this)'}</span><br>` +
+        `Documents: <span style="color:var(--text)">${d.docCount}</span>`;
+    } else {
+      badge.className = 'badge err'; badge.textContent = 'OLLAMA ✗';
+      box.className = 'ollama-status err';
+      box.innerHTML = `<span style="color:var(--red)">● Offline</span><br><br>` +
+        `To enable RAG features:<br>` +
+        `<span style="color:var(--muted)">1. Install from ollama.com<br>` +
+        `2. ollama pull nomic-embed-text<br>` +
+        `3. ollama pull llama3.2</span>`;
+    }
+  } catch (_) { }
+}
+
+async function insertDocument() {
+  const title = document.getElementById('docTitle').value.trim();
+  const text = document.getElementById('docText').value.trim();
+  const btn = document.getElementById('insertDocBtn');
+  const status = document.getElementById('insertStatus');
+  if (!title || !text) { status.textContent = '⚠ Need both a title and text.'; return; }
+
+  btn.disabled = true; btn.textContent = 'Embedding…';
+  status.innerHTML = '<span style="color:var(--muted)">Calling Ollama nomic-embed-text…</span>';
+
+  try {
+    const r = await fetch(API + '/doc/insert', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title, text })
+    });
+    const d = await r.json();
+    if (d.error) {
+      status.innerHTML = `<span style="color:var(--red)">✗ ${d.error}</span>`;
+    } else {
+      status.innerHTML = `<span style="color:var(--green)">✓ Inserted ${d.chunks} chunk(s) · ${d.dims}D embeddings</span>`;
+      document.getElementById('docTitle').value = '';
+      document.getElementById('docText').value = '';
+
+      // Insert a 16D fake vector into the visualizer DB so it shows up on the map
+      const emb16 = textToEmbedding(title + ' ' + text);
+      fetch(API + '/insert', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ metadata: title, category: 'doc', embedding: emb16 })
+      }).then(() => { loadItems().then(loadHNSW); });
+
+      loadDocList(); checkOllamaStatus();
+    }
+  } catch (_) {
+    status.innerHTML = '<span style="color:var(--red)">✗ Server error</span>';
+  }
+  btn.disabled = false; btn.textContent = '⚡ EMBED & INSERT';
+}
+
+async function loadDocList() {
+  try {
+    const r = await fetch(API + '/doc/list'), docs = await r.json();
+    document.getElementById('docCountLabel').textContent = docs.length;
+    if (!docs.length) {
+      document.getElementById('docList').innerHTML = '<div style="color:var(--muted);font-size:11px">No documents yet.</div>';
+      return;
+    }
+    document.getElementById('docList').innerHTML = docs.map(d => `
+      <div class="dcard">
+        <div class="dcard-title">${d.title}</div>
+        <div class="dcard-preview">${d.preview}</div>
+        <div class="dcard-foot">
+          <span class="dcard-words">${d.words} words</span>
+          <button class="del" onclick="deleteDoc(${d.id})">✕</button>
+        </div>
+      </div>`).join('');
+  } catch (_) { }
+}
+
+async function deleteDoc(id) {
+  try {
+    await fetch(`${API}/doc/delete/${id}`, { method: 'DELETE' });
+    loadDocList(); checkOllamaStatus();
+  } catch (_) { }
+}
+
+
+// ════════════════════════════════════════════════════════════
+//  RAG CHAT
+// ════════════════════════════════════════════════════════════
+document.getElementById('ragQuestion').addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.ctrlKey) askAI();
+});
+
+async function askAI() {
+  const question = document.getElementById('ragQuestion').value.trim();
+  if (!question) return;
+  const k = parseInt(document.getElementById('ragK').value);
+  const btn = document.getElementById('askBtn');
+  btn.disabled = true; btn.textContent = 'Thinking…';
+
+  const history = document.getElementById('chatHistory');
+  // Clear previous conversation
+  history.innerHTML = '';
+
+  // Show question bubble
+  const qDiv = document.createElement('div'); qDiv.className = 'chat-q';
+  qDiv.textContent = question; history.appendChild(qDiv);
+
+  // Show thinking indicator
+  const thinkDiv = document.createElement('div'); thinkDiv.className = 'thinking';
+  thinkDiv.innerHTML = '<div class="spinner"></div>Retrieving context & generating answer…';
+  history.appendChild(thinkDiv);
+  history.scrollTop = history.scrollHeight;
+
+  // Update the scatter plot visualizer in the background using the real 768D DB
+  fetch(API + '/doc/search', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ question, k })
+  })
+    .then(res => res.json())
+    .then(data => {
+      if (data.contexts && data.contexts.length > 0) {
+        hitIds = new Set();
+        let sx = 0, sy = 0, sw = 0;
+        data.contexts.forEach((ctx, i) => {
+          // Match the RAG chunk title back to the visualizer document metadata
+          const pt = pcaPoints.find(p => p.item.category === 'doc' && ctx.title.startsWith(p.item.metadata));
+          if (pt) {
+            hitIds.add(pt.item.id);
+            const w = 1 / (i + 1); sx += pt.x * w; sy += pt.y * w; sw += w;
+          }
+        });
+        if (sw > 0) queryPt = { x: sx / sw + (Math.random() - .5) * .015, y: sy / sw + (Math.random() - .5) * .015 };
+      } else {
+        hitIds = new Set();
+        // Fallback: If no RAG docs match, visually move the star to the 16D semantic space anyway!
+        const emb16 = textToEmbedding(question);
+        fetch(`${API}/search?v=${emb16.join(',')}&k=3&metric=cosine&algo=hnsw`)
+          .then(res2 => res2.json())
+          .then(data2 => {
+            if (data2.results && data2.results.length > 0) {
+              let sx = 0, sy = 0, sw = 0;
+              for (let i = 0; i < Math.min(3, data2.results.length); i++) {
+                const pt = pcaPoints.find(p => p.item.id === data2.results[i].id);
+                if (pt) { const w = 1 / (i + 1); sx += pt.x * w; sy += pt.y * w; sw += w; }
+              }
+              if (sw > 0) queryPt = { x: sx / sw + (Math.random() - .5) * .015, y: sy / sw + (Math.random() - .5) * .015 };
+            }
+          }).catch(() => { });
+      }
+    }).catch(() => { });
+
+  try {
+    const r = await fetch(API + '/doc/ask', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ question, k })
+    });
+    const d = await r.json();
+    thinkDiv.remove();
+
+    const aDiv = document.createElement('div'); aDiv.className = 'chat-a';
+
+    if (d.error) {
+      aDiv.innerHTML = `<div class="chat-a-label">ERROR</div><div class="chat-a-text" style="color:var(--red)">${d.error}</div>`;
+    } else {
+      // Build answer block with typewriter
+      aDiv.innerHTML = `<div class="chat-a-label">🤖 ${d.model || 'llm'}</div>` +
+        `<div class="chat-a-text" id="typeTarget"></div>` +
+        `<div class="chat-ctx">` +
+        `<div class="chat-ctx-label">RETRIEVED CONTEXT (${d.contexts.length} chunks)</div>` +
+        d.contexts.map((c, i) => `<span class="ctx-chip" onclick="toggleCtx(${i})">#${i + 1} ${c.title} · ${c.distance.toFixed(3)}</span>` +
+          `<div class="ctx-expand" id="ctx-${i}">${c.text}</div>`).join('') +
+        `</div>`;
+      history.appendChild(aDiv);
+
+      // Typewriter effect
+      const target = aDiv.querySelector('#typeTarget');
+      target.classList.add('typing');
+      const full = d.answer; let i = 0;
+      const timer = setInterval(() => {
+        if (i >= full.length) { clearInterval(timer); target.classList.remove('typing'); return; }
+        const chunk = full.slice(i, i + 3); target.textContent += chunk; i += 3;
+        history.scrollTop = history.scrollHeight;
+      }, 18);
+    }
+
+  } catch (e) {
+    thinkDiv.remove();
+    const err = document.createElement('div'); err.className = 'chat-a';
+    err.innerHTML = '<div class="chat-a-label">ERROR</div><div class="chat-a-text" style="color:var(--red)">Server error — is the backend running?</div>';
+    history.appendChild(err);
+  }
+
+  document.getElementById('ragQuestion').value = '';
+  btn.disabled = false; btn.textContent = '🤖 ASK AI';
+  history.scrollTop = history.scrollHeight;
+}
+
+
+function toggleCtx(i) {
+  const el = document.getElementById('ctx-' + i);
+  el.style.display = el.style.display === 'block' ? 'none' : 'block';
+}
+
 function switchTab(name) {
   document.querySelectorAll('.tab').forEach((t, i) => {
     const names = ['search', 'docs', 'rag'];
@@ -302,3 +513,4 @@ async function addVector() {
 
 resize(); drawFrame();
 loadItems().then(loadHNSW);
+checkOllamaStatus();
